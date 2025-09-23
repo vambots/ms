@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# cube_a_star_ros2_usd.py
-# Use Isaac Sim's Python to run:  ~/isaacsim/python.sh cube_a_star_ros2_usd.py
+# cube_a_star_keys.py
+# Run with Isaac Sim's Python:  ~/isaacsim/python.sh cube_a_star_keys.py
 import math
 import heapq
 from typing import List, Tuple, Optional
@@ -12,6 +12,11 @@ simulation_app = SimulationApp({"headless": False})
 import omni.usd
 from omni.isaac.core import World
 from pxr import Usd, UsdGeom, Gf
+
+# Keyboard input (Omniverse Kit)
+import carb.input
+
+
 
 # ---------- ROS 2 ----------
 import rclpy
@@ -28,7 +33,8 @@ GRID_ORIGIN = (-MAP_W/2, -MAP_H/2)  # world XY of grid cell (0,0)
 AGENT_SIZE = 0.5                  # cube edge (m)
 START_XY = (-3.0, -3.0)
 GOAL_XY  = ( 3.0,  3.0)
-AGENT_SPEED = 0.4                 # m/s
+AGENT_SPEED = 0.4                 # m/s when following path
+MANUAL_SPEED = 1.2                # m/s when driving with arrow keys
 ALLOW_DIAG = True
 OCC_THRESH = 50                   # cells >= this are considered occupied
 
@@ -66,7 +72,8 @@ class AStarGrid:
         return 0 <= x < self.w_cells and 0 <= y < self.h_cells
 
     def is_free(self, g: GridCoord, occ_thresh=OCC_THRESH) -> bool:
-        return self.data[self.idx(g)] < occ_thresh and self.data[self.idx(g)] >= -1
+        d = self.data[self.idx(g)]
+        return (-1 <= d) and (d < occ_thresh)
 
     def world_to_grid(self, x: float, y: float) -> GridCoord:
         gx = int((x - self.origin[0]) / self.res)
@@ -116,7 +123,7 @@ class AStarGrid:
         closed = set()
         while openq:
             _, cur = heapq.heappop(openq)
-            if cur in closed: 
+            if cur in closed:
                 continue
             if cur == g:
                 path = [cur]
@@ -136,26 +143,15 @@ class AStarGrid:
                 heapq.heappush(openq, (fsc[nbr], nbr))
         return []
 
-# ========== ROS bridge node ==========
+# ========== ROS node (publisher only: /plan + tf) ==========
 class ROSBridge(Node):
     def __init__(self, global_frame='map', base_frame='base_link',
-                 plan_topic='/plan', goal_topic='/goal_pose'):
+                 plan_topic='/plan'):
         super().__init__('cube_a_star_bridge')
         self.global_frame = global_frame
         self.base_frame = base_frame
         self.plan_pub = self.create_publisher(Path, plan_topic, 10)
-        self.goal_sub = self.create_subscription(PoseStamped, goal_topic, self._on_goal, 10)
         self.tf_br = TransformBroadcaster(self)
-        self._latest_goal: Optional[Tuple[float,float]] = None
-
-    def _on_goal(self, msg: PoseStamped):
-        gx, gy = float(msg.pose.position.x), float(msg.pose.position.y)
-        self._latest_goal = (gx, gy)
-        self.get_logger().info(f"Goal received: ({gx:.2f}, {gy:.2f})")
-
-    def pop_goal(self):
-        g, self._latest_goal = self._latest_goal, None
-        return g
 
     def publish_path(self, waypoints_xy: List[Tuple[float,float]]):
         if not waypoints_xy:
@@ -166,9 +162,7 @@ class ROSBridge(Node):
             ps = PoseStamped()
             ps.header = path.header
             ps.pose.position = Point(x=float(x), y=float(y), z=0.0)
-            nx, ny = waypoints_xy[i+1] if i+1 < len(waypoints_xy) else (x, y)
-            yaw = math.atan2(ny - y, nx - x) if (nx != x or ny != y) else 0.0
-            q = Gf.Quatf(math.cos(yaw/2.0), 0.0, 0.0, math.sin(yaw/2.0))
+            # (orientation kept identity for simplicity)
             ps.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
             path.poses.append(ps)
         self.plan_pub.publish(path)
@@ -180,11 +174,11 @@ class ROSBridge(Node):
         t.child_frame_id = self.base_frame
         t.transform.translation.x = float(x)
         t.transform.translation.y = float(y)
-        q = Gf.Quatf(math.cos(yaw/2.0), 0.0, 0.0, math.sin(yaw/2.0))
+        # identity quaternion (face-forward visual); adjust if you want yaw
         t.transform.rotation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
         self.tf_br.sendTransform(t)
 
-# ========== Build stage with USD visuals (your style) ==========
+# ========== Build stage with USD visuals ==========
 world = World()
 world.scene.add_default_ground_plane()
 
@@ -222,8 +216,9 @@ axf = UsdGeom.Xformable(agent_prim.GetPrim())
 axf.AddTranslateOp().Set(Gf.Vec3f(START_XY[0], START_XY[1], AGENT_SIZE/2))
 colorize(agent_prim.GetPrim(), (0.2, 0.5, 0.9))
 
-world.reset() # reset to initial state
+world.reset()
 world.play()
+
 # ========== Helpers to get/set the USD agent pose ==========
 def get_agent_xy() -> Tuple[float, float]:
     xf = UsdGeom.Xformable(agent_prim.GetPrim())
@@ -237,80 +232,148 @@ def set_agent_xy(x: float, y: float):
     api.SetTranslate(Gf.Vec3d(float(x), float(y), float(AGENT_SIZE/2)),
                      Usd.TimeCode.Default())
 
-def set_goal_xy(x: float, y: float):
-    api = UsdGeom.XformCommonAPI(goal_prim.GetPrim())
-    api.SetTranslate(Gf.Vec3d(float(x), float(y), 0.12),
-                     Usd.TimeCode.Default())
 # ========== Build planning grid from AABBs ==========
 grid = AStarGrid(MAP_W, MAP_H, RES, GRID_ORIGIN)
 for (xmin, ymin, xmax, ymax) in OBST_AABBS:
     grid.mark_box_obstacle(xmin, ymin, xmax, ymax, val=100)
 
-# ========== ROS init ==========
+# ========== ROS init (publisher only) ==========
 if not rclpy.ok():
     rclpy.init(args=None)
-ros = ROSBridge(global_frame="map", base_frame="base_link",
-                plan_topic="/plan", goal_topic="/goal_pose")
+ros = ROSBridge(global_frame="map", base_frame="base_link", plan_topic="/plan")
 
-# ========== Initial plan ==========
-agent_xy = START_XY
-goal_xy  = GOAL_XY
-path_xy: List[Tuple[float,float]] = grid.plan(agent_xy, goal_xy)
-ros.publish_path(path_xy)
+# ========== Keyboard handling ==========
+import carb.input
+
+# ---------- Key State ----------
+key_state = {
+    "up": False, "down": False, "left": False, "right": False,
+    "enter": False, "space": False,
+}
+
+# ---------- Input Interface ----------
+import omni.appwindow
+import carb.input as carb_input
+app_window = omni.appwindow.get_default_app_window()
+keyboard   = app_window.get_keyboard()
+
+input_iface = carb_input.acquire_input_interface()
+
+def _on_key_event(event: carb_input.KeyboardEvent) -> bool:
+    is_press = event.type == carb_input.KeyboardEventType.KEY_PRESS
+    is_release = event.type == carb_input.KeyboardEventType.KEY_RELEASE
+
+    if event.input == carb_input.KeyboardInput.UP:
+        key_state["up"] = is_press
+        if is_press: cancel_follow()
+    elif event.input == carb_input.KeyboardInput.DOWN:
+        key_state["down"] = is_press
+        if is_press: cancel_follow()
+    elif event.input == carb_input.KeyboardInput.LEFT:
+        key_state["left"] = is_press
+        if is_press: cancel_follow()
+    elif event.input == carb_input.KeyboardInput.RIGHT:
+        key_state["right"] = is_press
+        if is_press: cancel_follow()
+    elif event.input == carb_input.KeyboardInput.ENTER:
+        if is_press: key_state["enter"] = True
+    elif event.input == carb_input.KeyboardInput.SPACE:
+        if is_press: key_state["space"] = True
+
+    return True  # continue event propagation
+
+# subscribe with the new API
+kb_subscription = input_iface.subscribe_to_keyboard_events(keyboard, _on_key_event)
+
+# ---------- Planner/driver state ----------
+path_xy: List[Tuple[float,float]] = []
 path_i = 0
-print("[A*] Ready. Publish /goal_pose to replan. Viewing /plan in RViz.")
-print()
+following = False
+
+def cancel_follow():
+    global following, path_i
+    following = False
+    path_i = 0
+    print("[keys] Follow cancelled. Waiting for a new goal to replan.")
+
+def trigger_plan_and_follow():
+    global path_xy, path_i, following
+    start_xy = get_agent_xy()
+    path_xy = grid.plan(start_xy, GOAL_XY)
+    ros.publish_path(path_xy)
+    path_i = 0
+    following = bool(path_xy)
+
+# Initial path (optional): publish empty plan
+ros.publish_path(path_xy)
+print("[A*] Ready. Use arrows to drive. Press Enter to plan to GOAL and follow. Space to stop.")
+
 # ========== Main loop ==========
 try:
     while simulation_app.is_running():
-        # Sim step time
         dt = world.get_physics_dt()
-
-        # Pump ROS callbacks
+        # No subscriptions to spin, but keep Node alive
         rclpy.spin_once(ros, timeout_sec=0.0)
 
-        # New goal?
-        g = ros.pop_goal()
-        if g is not None:
-            goal_xy = (g[0], g[1])
-            set_goal_xy(goal_xy[0], goal_xy[1])
-            agent_xy = get_agent_xy()
-            path_xy = grid.plan(agent_xy, goal_xy)
-            ros.publish_path(path_xy)
-            path_i = 0
+        # Handle one-shot keys
+        if key_state["enter"]:
+            trigger_plan_and_follow()
+            key_state["enter"] = False
+        if key_state["space"]:
+            cancel_follow()
+            key_state["space"] = False
 
-        # Follow path (simple P-controller to next waypoint)
-        if path_xy and path_i < len(path_xy):
-            ax, ay = get_agent_xy()
+        # Manual driving with arrows (cancels follow when key pressed)
+        ax, ay = get_agent_xy()
+        move_x = 0.0
+        move_y = 0.0
+        if key_state["up"]:
+            move_y += 1.0
+        if key_state["down"]:
+            move_y -= 1.0
+        if key_state["right"]:
+            move_x += 1.0
+        if key_state["left"]:
+            move_x -= 1.0
+
+        if (move_x != 0.0) or (move_y != 0.0):
+            # Normalize for diagonal and step
+            norm = math.hypot(move_x, move_y)
+            step = MANUAL_SPEED * dt
+            nx = ax + (move_x / norm) * step
+            ny = ay + (move_y / norm) * step
+            set_agent_xy(nx, ny)
+            ax, ay = nx, ny  # update for TF below
+
+        # Follow planned path if active
+        if following and path_xy and path_i < len(path_xy):
             tx, ty = path_xy[path_i]
             dx, dy = tx - ax, ty - ay
             dist = math.hypot(dx, dy)
             step = AGENT_SPEED * dt
             if dist < max(0.02, step):
                 path_i += 1
+                if path_i >= len(path_xy):
+                    following = False
             else:
                 nx = ax + (dx / max(dist, 1e-6)) * step
                 ny = ay + (dy / max(dist, 1e-6)) * step
                 set_agent_xy(nx, ny)
-                agent_xy = (nx, ny)
-        else:
-            agent_xy = get_agent_xy()
+                ax, ay = nx, ny
 
-        # Publish TF (map -> base_link) with a crude yaw along path
-        yaw = 0.0
-        if path_xy and path_i < len(path_xy):
-            ax, ay = agent_xy
-            tx, ty = path_xy[min(path_i, len(path_xy)-1)]
-            if (tx != ax) or (ty != ay):
-                yaw = math.atan2(ty - ay, tx - ax)
-        ros.publish_tf(agent_xy[0], agent_xy[1], yaw)
+        # Publish TF
+        ros.publish_tf(ax, ay, 0.0)
 
         world.step(render=True)
 
 except Exception as e:
     print("Exception:", e)
-    pass
 finally:
+    try:
+        if kb_subscription:
+            input_iface.unsubscribe_to_keyboard_events(kb_subscription)
+    except Exception:
+        pass
     try:
         ros.destroy_node()
         rclpy.shutdown()
