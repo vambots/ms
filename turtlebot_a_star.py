@@ -43,6 +43,7 @@ OBST_AABBS = [
 
 # Your local USD path (from your earlier log)
 LOCAL_TURTLEBOT_USD = "/home/GTL/sgambhir/IsaacAssets/Turtlebot3/turtlebot3_burger.usd"
+LOCAL_TURTLEBOT_USD = "/home/GTL/sgambhir/tmp_turtlebot3_src/turtlebot3/turtlebot3_description/urdf/turtlebot3_burger/turtlebot3_burger.usd"
 
 # We will move this wrapper (pure Xform). The robot USD sits as its child.
 TURTLE_MOVE_PRIM  = "/World/TurtleRoot"        # we move/read this
@@ -216,7 +217,22 @@ colorize(goal_prim.GetPrim(), (0.2, 0.9, 0.2))
 # print("[INFO] Switch viewport to /World/DebugCamera if needed.")
 
 # ---------- Spawn TurtleBot using a wrapper Xform ----------
-def ensure_xform(path: str) -> Usd.Prim:
+# ---------- Spawn TurtleBot (wrapper Xform + explicit primPath + payload load) ----------
+from pxr import Usd, UsdGeom, Sdf
+
+# 1) Your confirmed USD and the *root prim inside it*
+LOCAL_TURTLEBOT_USD = "/home/GTL/sgambhir/tmp_turtlebot3_src/turtlebot3/turtlebot3_description/urdf/turtlebot3_burger/turtlebot3_burger.usd"
+TARGET_PRIM         = "/turtlebot3_burger"   # root prim inside that USD (from your screenshot)
+
+# 2) We move this wrapper; the robot USD is referenced under it
+TURTLE_MOVE_PRIM  = "/World/TurtleRoot"
+TURTLE_CHILD_PRIM = "/World/TurtleRoot/Model"
+z_height = 0.26   # raise a bit so it never clips into the ground
+
+# (optional but recommended) make sure stage units are meters
+UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+def _ensure_xform(path: str) -> Usd.Prim:
     prim = stage.GetPrimAtPath(path)
     if not prim or not prim.IsValid():
         prim = UsdGeom.Xform.Define(stage, path).GetPrim()
@@ -224,32 +240,41 @@ def ensure_xform(path: str) -> Usd.Prim:
     return prim
 
 try:
-    root_xf = ensure_xform(TURTLE_MOVE_PRIM)
-    child_xf = ensure_xform(TURTLE_CHILD_PRIM)
+    # Create wrapper and child Xforms
+    root_xf  = _ensure_xform(TURTLE_MOVE_PRIM)
+    child_xf = _ensure_xform(TURTLE_CHILD_PRIM)
 
-    # Clear & add reference on child
+    # Clear any previous reference and attach the TurtleBot at the explicit prim
     refs = child_xf.GetReferences()
     refs.ClearReferences()
-    refs.AddReference(LOCAL_TURTLEBOT_USD)
+    refs.AddReference(Sdf.Reference(assetPath=LOCAL_TURTLEBOT_USD, primPath=TARGET_PRIM))
 
-    # Place the wrapper at START_XY
-    UsdGeom.XformCommonAPI(root_xf).SetTranslate(Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height))
+    # Many robot USDs use payloads -> ensure they load
+    child_xf.Load(Usd.LoadWithDescendants)
 
-    print(f"[INFO] Referenced TurtleBot: {LOCAL_TURTLEBOT_USD} -> {TURTLE_CHILD_PRIM}")
-    for c in child_xf.GetChildren():
-        print("[DEBUG] Child under Model:", c.GetPath())
+    # Place the wrapper at START_XY (so all children move together)
+    UsdGeom.XformCommonAPI(root_xf).SetTranslate(
+        Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height)
+    )
+
+    # Debug prints so you can verify population
+    kids = list(child_xf.GetChildren())
+    print(f"[INFO] Referenced {LOCAL_TURTLEBOT_USD} @ {TARGET_PRIM} -> {TURTLE_CHILD_PRIM}")
+    print(f"[INFO] Child count under Model: {len(kids)}")
+    for c in kids[:12]:
+        print("   [DEBUG]", c.GetPath())
 
 except Exception as e:
-    print("[WARN] Could not reference TurtleBot; creating a cylinder at the same wrapper path. Error:", e)
-    # keep the same wrapper path so movement code still works
+    # Fallback: visible placeholder under the same wrapper path
+    print("[WARN] Could not reference TurtleBot; using a cylinder placeholder. Error:", e)
     cyl = UsdGeom.Cylinder.Define(stage, f"{TURTLE_MOVE_PRIM}/Cylinder")
-    cyl.CreateHeightAttr(0.2); cyl.CreateRadiusAttr(0.18)
+    cyl.CreateHeightAttr(0.2)
+    cyl.CreateRadiusAttr(0.18)
     UsdGeom.Imageable(cyl.GetPrim()).MakeVisible()
-    # wrapper translate still applies
-    UsdGeom.XformCommonAPI(UsdGeom.Xform(root_xf).GetPrim()).SetTranslate(Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height))
+    UsdGeom.XformCommonAPI(root_xf).SetTranslate(
+        Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height)
+    )
 
-world.reset()
-world.play()
 
 # ===== Xform utilities (version-proof) =====
 def _get_local_mat(prim) -> Gf.Matrix4d:
