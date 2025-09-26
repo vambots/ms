@@ -48,7 +48,7 @@ LOCAL_TURTLEBOT_USD = "/home/GTL/sgambhir/tmp_turtlebot3_src/turtlebot3/turtlebo
 # We will move this wrapper (pure Xform). The robot USD sits as its child.
 TURTLE_MOVE_PRIM  = "/World/TurtleRoot"        # we move/read this
 TURTLE_CHILD_PRIM = "/World/TurtleRoot/Model"  # holds the USD reference
-z_height = 0.20
+z_height = 0.20 # idk what the turtlebot height is, so just raise a bit
 
 # ===== Helper for coloring simple USD prims =====
 def colorize(prim, rgb):
@@ -227,7 +227,7 @@ TARGET_PRIM         = "/turtlebot3_burger"   # root prim inside that USD (from y
 # 2) We move this wrapper; the robot USD is referenced under it
 TURTLE_MOVE_PRIM  = "/World/TurtleRoot"
 TURTLE_CHILD_PRIM = "/World/TurtleRoot/Model"
-z_height = 0.26   # raise a bit so it never clips into the ground
+z_height = 0.0  # raise a bit so it never clips into the ground
 
 # (optional but recommended) make sure stage units are meters
 UsdGeom.SetStageMetersPerUnit(stage, 1.0)
@@ -238,7 +238,7 @@ def _ensure_xform(path: str) -> Usd.Prim:
         prim = UsdGeom.Xform.Define(stage, path).GetPrim()
     UsdGeom.Imageable(prim).MakeVisible()
     return prim
-
+BOT_SCALE = 2  # scale UP the bot a bit
 try:
     # Create wrapper and child Xforms
     root_xf  = _ensure_xform(TURTLE_MOVE_PRIM)
@@ -253,9 +253,12 @@ try:
     child_xf.Load(Usd.LoadWithDescendants)
 
     # Place the wrapper at START_XY (so all children move together)
-    UsdGeom.XformCommonAPI(root_xf).SetTranslate(
-        Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height)
-    )
+    UsdGeom.XformCommonAPI(root_xf) \
+           .SetTranslate(Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height)) \
+        #    .SetScale(Gf.Vec3f(BOT_SCALE, BOT_SCALE, BOT_SCALE))
+    root_api = UsdGeom.XformCommonAPI(root_xf)   # same root_xf you used for SetTranslate
+    root_api.SetScale(Gf.Vec3f(BOT_SCALE, BOT_SCALE, BOT_SCALE))
+
 
     # Debug prints so you can verify population
     kids = list(child_xf.GetChildren())
@@ -272,7 +275,9 @@ except Exception as e:
     cyl.CreateRadiusAttr(0.18)
     UsdGeom.Imageable(cyl.GetPrim()).MakeVisible()
     UsdGeom.XformCommonAPI(root_xf).SetTranslate(
-        Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height)
+        Gf.Vec3d(float(START_XY[0]), float(START_XY[1]) \
+                  , z_height
+                )
     )
 
 
