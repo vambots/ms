@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# turtlebot_a_star_keys_ddrive_ros.py
+# turtlebot_a_star_keys_ddrive_rclpy.py
 import math, heapq
 from typing import List, Tuple, Optional
 
@@ -15,7 +15,7 @@ from pxr import Usd, UsdGeom, Gf, Sdf
 import omni.appwindow
 import carb.input as carb_input
 
-# ---------- ROS 2 ----------
+# ---------- ROS 2 (pure rclpy) ----------
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Point, Quaternion, TransformStamped, Twist
@@ -23,7 +23,7 @@ from nav_msgs.msg import Path
 from tf2_ros import TransformBroadcaster
 from std_msgs.msg import Header, String
 
-# ========== Config ==========
+# ================== Config ==================
 MAP_W, MAP_H = 20.0, 20.0
 RES = 0.10
 GRID_ORIGIN = (-MAP_W/2, -MAP_H/2)
@@ -32,33 +32,35 @@ GOAL_XY  = ( 3.0,  3.0)
 ALLOW_DIAG = True
 OCC_THRESH = 50
 
-# Manual & auto drive tuning
-AGENT_SPEED   = 0.6           # m/s when following path
-MAX_V_MANUAL  = 1.2           # m/s   (↑/↓)
-MAX_W_MANUAL  = 2.0           # rad/s (←/→)
-MAX_W_AUTO    = 1.5           # rad/s when following path
-ANG_KP        = 2.5           # P-gain for heading correction
-ARRIVE_DIST   = 0.10          # waypoint reach threshold (m)
-TWIST_TIMEOUT = 0.5           # seconds before /cmd_vel considered inactive
+# Differential-drive tuning
+MAX_V_MANUAL = 1.2         # m/s (keys)
+MAX_W_MANUAL = 2.0         # rad/s (keys)
+AGENT_SPEED  = 0.6         # m/s (A* follow)
+MAX_W_AUTO   = 1.5         # rad/s (A* follow)
+ANG_KP       = 2.5         # heading P-gain
+ARRIVE_DIST  = 0.10        # m
+TWIST_TIMEOUT = 0.5        # s (ROS /cmd_vel timeout)
 
-# Obstacles as AABBs in world XY (xmin, ymin, xmax, ymax)
+# Obstacles (world XY AABBs)
 OBST_AABBS = [
     (-1.5, -2.0,  1.5, -1.0),
     (-2.0,  1.0, -1.0,  4.0),
     ( 1.0,  1.1,  3.0,  1.9),
 ]
 
-# Your working TurtleBot USD and its root prim
+# Your TurtleBot USD + prim (confirmed paths you used)
 LOCAL_TURTLEBOT_USD = "/home/GTL/sgambhir/tmp_turtlebot3_src/turtlebot3/turtlebot3_description/urdf/turtlebot3_burger/turtlebot3_burger.usd"
-TARGET_PRIM         = "/turtlebot3_burger"   # root prim inside that USD
+TARGET_PRIM_IN_FILE = "/turtlebot3_burger"      # prim inside that USD
 
-# We move this wrapper (pure Xform). The robot USD sits as its child.
-TURTLE_MOVE_PRIM  = "/World/TurtleRoot"        # we move/read this
-TURTLE_CHILD_PRIM = "/World/TurtleRoot/Model"  # holds the USD reference
-z_height = 0.05                                 # slight lift off ground
-BOT_SCALE = 2                              # ×100 if asset was authored in cm
+# We animate this wrapper; TB3 is referenced under it
+TURTLE_MOVE_PRIM  = "/World/TurtleRoot"
+TURTLE_CHILD_PRIM = "/World/TurtleRoot/Model"
 
-# ===== Helper for coloring simple USD prims =====
+# Visual + scale
+z_height = 0.05
+BOT_SCALE = 2      # ×100 if asset authored in centimeters
+
+# ================== Helpers ==================
 def colorize(prim, rgb):
     try:
         UsdGeom.Gprim(prim).CreateDisplayColorAttr([Gf.Vec3f(*rgb)])
@@ -74,7 +76,7 @@ class AStarGrid:
         self.w_cells = int(round(width_m / res))
         self.h_cells = int(round(height_m / res))
         self.origin = (float(origin_xy[0]), float(origin_xy[1]))
-        self.data = [-1] * (self.w_cells * self.h_cells)  # -1 free, >=100 occupied
+        self.data = [-1] * (self.w_cells * self.h_cells)
 
     def idx(self, g): return g[1] * self.w_cells + g[0]
     def in_bounds(self, g): return 0 <= g[0] < self.w_cells and 0 <= g[1] < self.h_cells
@@ -143,39 +145,32 @@ class AStarGrid:
                 heapq.heappush(openq, (fsc[nbr], nbr))
         return []
 
-# ===== ROS node: publish /plan + tf, subscribe to cmd_vel, goal, simple control =====
+# ===== ROS bridge (publish /plan + tf, subscribe to /cmd_vel and control cmds) =====
 class ROSBridge(Node):
     def __init__(self, global_frame='map', base_frame='base_link', plan_topic='/plan',
-                 on_set_goal=None, on_plan=None, on_cancel=None, on_speed=None,
-                 auto_plan_on_goal=True, twist_timeout=TWIST_TIMEOUT):
-        super().__init__('turtlebot_a_star_bridge')
+                 on_set_goal=None, on_plan=None, on_cancel=None,
+                 twist_timeout=TWIST_TIMEOUT):
+        super().__init__('turtlebot_ddrive_bridge')
         self.global_frame = global_frame
         self.base_frame   = base_frame
         self.plan_pub     = self.create_publisher(Path, plan_topic, 10)
         self.tf_br        = TransformBroadcaster(self)
+        self.on_set_goal  = on_set_goal
+        self.on_plan      = on_plan
+        self.on_cancel    = on_cancel
 
-        # Hooks into the sim (functions provided below)
-        self.on_set_goal = on_set_goal
-        self.on_plan     = on_plan
-        self.on_cancel   = on_cancel
-        self.on_speed    = on_speed
-        self.auto_plan_on_goal = auto_plan_on_goal
-
-        # Subscribers
+        # Subscribers: /cmd_vel + /move_base_simple/goal + /turtlebot_ctrl
         self.create_subscription(Twist, '/cmd_vel', self._twist_cb, 10)
         self.create_subscription(PoseStamped, '/move_base_simple/goal', self._goal_cb, 10)
         self.create_subscription(String, '/turtlebot_ctrl', self._ctrl_cb, 10)
 
-        # Twist state
         self._twist_v = 0.0
         self._twist_w = 0.0
         self._last_twist = None
         self._twist_timeout = float(twist_timeout)
 
-    # ----- publishers -----
+    # publishers
     def publish_path(self, waypoints_xy: List[Tuple[float,float]]):
-        if not waypoints_xy:
-            return
         path = Path()
         path.header = Header(stamp=self.get_clock().now().to_msg(), frame_id=self.global_frame)
         for (x, y) in waypoints_xy:
@@ -197,7 +192,7 @@ class ROSBridge(Node):
         t.transform.rotation = Quaternion(x=0.0, y=0.0, z=math.sin(half), w=math.cos(half))
         self.tf_br.sendTransform(t)
 
-    # ----- subscribers -----
+    # subscribers
     def _twist_cb(self, msg: Twist):
         self._twist_v = float(msg.linear.x)
         self._twist_w = float(msg.angular.z)
@@ -206,7 +201,7 @@ class ROSBridge(Node):
     def _goal_cb(self, msg: PoseStamped):
         if self.on_set_goal:
             self.on_set_goal(float(msg.pose.position.x), float(msg.pose.position.y))
-        if self.auto_plan_on_goal and self.on_plan:
+        if self.on_plan:
             self.on_plan()
 
     def _ctrl_cb(self, msg: String):
@@ -219,32 +214,28 @@ class ROSBridge(Node):
             elif cmd in ("cancel","stop") and self.on_cancel:
                 self.on_cancel()
             elif cmd == "set_goal" and len(tokens) >= 3 and self.on_set_goal:
-                x, y = float(tokens[1]), float(tokens[2])
-                self.on_set_goal(x, y)
-            elif cmd == "speed" and len(tokens) >= 2 and self.on_speed:
-                self.on_speed(max(0.0, float(tokens[1])), None)
-            elif cmd == "angspeed" and len(tokens) >= 2 and self.on_speed:
-                self.on_speed(None, max(0.0, float(tokens[1])))
+                x, y = float(tokens[1]), float(tokens[2]); self.on_set_goal(x, y)
         except Exception as e:
             self.get_logger().warn(f"/turtlebot_ctrl parse failed: {e}")
 
-    # ----- API for main loop -----
     def get_active_twist(self) -> Tuple[float,float,bool]:
-        """Return (v, w, active) where active=False if last cmd too old."""
         if self._last_twist is None:
             return 0.0, 0.0, False
         age = (self.get_clock().now() - self._last_twist).nanoseconds * 1e-9
-        if age > self._twist_timeout:
-            return 0.0, 0.0, False
-        return self._twist_v, self._twist_w, True
+        active = age <= self._twist_timeout
+        return (self._twist_v if active else 0.0,
+                self._twist_w if active else 0.0,
+                active)
 
-# ===== Build stage visuals =====
+# ================== Stage build ==================
 world = World()
 world.scene.add_default_ground_plane()
-
+import os
 stage = omni.usd.get_context().get_stage()
 UsdGeom.Xform.Define(stage, "/World")
-UsdGeom.SetStageMetersPerUnit(stage, 1.0)  # ensure meters
+stage.SetEditTarget(stage.GetRootLayer())          # <-- key
+UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+assert os.path.isfile(LOCAL_TURTLEBOT_USD), f"USD not found: {LOCAL_TURTLEBOT_USD}"
 
 # Ground
 gp = UsdGeom.Cube.Define(stage, "/World/GroundVisual")
@@ -253,7 +244,7 @@ UsdGeom.Xformable(gp.GetPrim()).AddScaleOp().Set(Gf.Vec3f(MAP_W, MAP_H, 0.05))
 UsdGeom.Xformable(gp.GetPrim()).AddTranslateOp().Set(Gf.Vec3f(0, 0, -0.03))
 colorize(gp.GetPrim(), (0.25, 0.25, 0.25))
 
-# Obstacles (visuals)
+# Obstacles
 for k, (xmin, ymin, xmax, ymax) in enumerate(OBST_AABBS):
     cx, cy = (xmin+xmax)/2.0, (ymin+ymax)/2.0
     sx, sy = abs(xmax-xmin), abs(ymax-ymin)
@@ -264,42 +255,61 @@ for k, (xmin, ymin, xmax, ymax) in enumerate(OBST_AABBS):
     xf.AddTranslateOp().Set(Gf.Vec3f(cx, cy, 0.25))
     colorize(p.GetPrim(), (0.8, 0.2, 0.2))
 
-# Goal (visual)
+# Goal
 goal_prim = UsdGeom.Sphere.Define(stage, "/World/Goal")
 goal_prim.CreateRadiusAttr(0.12)
 UsdGeom.Xformable(goal_prim.GetPrim()).AddTranslateOp().Set(Gf.Vec3f(GOAL_XY[0], GOAL_XY[1], 0.12))
 colorize(goal_prim.GetPrim(), (0.2, 0.9, 0.2))
 goal_api = UsdGeom.XformCommonAPI(goal_prim.GetPrim())
-
 def set_goal_xy(x: float, y: float):
-    global GOAL_XY
-    GOAL_XY = (float(x), float(y))
+    global GOAL_XY; GOAL_XY = (float(x), float(y))
     goal_api.SetTranslate(Gf.Vec3f(GOAL_XY[0], GOAL_XY[1], 0.12))
     print(f"[goal] Set to ({GOAL_XY[0]:.2f}, {GOAL_XY[1]:.2f})")
 
-# ---------- Spawn TurtleBot (wrapper Xform + explicit primPath + payload load) ----------
+# ---------- Spawn TurtleBot under a wrapper with SRT ops ----------
+from pxr import Usd, UsdGeom, Sdf
+
+# 1) Your confirmed USD and the *root prim inside it*
+LOCAL_TURTLEBOT_USD = "/home/GTL/sgambhir/tmp_turtlebot3_src/turtlebot3/turtlebot3_description/urdf/turtlebot3_burger/turtlebot3_burger.usd"
+TARGET_PRIM         = "/turtlebot3_burger"   # root prim inside that USD (from your screenshot)
+
+# 2) We move this wrapper; the robot USD is referenced under it
+TURTLE_MOVE_PRIM  = "/World/TurtleRoot"
+TURTLE_CHILD_PRIM = "/World/TurtleRoot/Model"
+z_height = 0.0  # raise a bit so it never clips into the ground
+
+# (optional but recommended) make sure stage units are meters
+UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
 def _ensure_xform(path: str) -> Usd.Prim:
     prim = stage.GetPrimAtPath(path)
     if not prim or not prim.IsValid():
         prim = UsdGeom.Xform.Define(stage, path).GetPrim()
     UsdGeom.Imageable(prim).MakeVisible()
     return prim
-
+BOT_SCALE = 2  # scale UP the bot a bit
 try:
+    # Create wrapper and child Xforms
     root_xf  = _ensure_xform(TURTLE_MOVE_PRIM)
     child_xf = _ensure_xform(TURTLE_CHILD_PRIM)
 
-    # add reference to explicit prim
+    # Clear any previous reference and attach the TurtleBot at the explicit prim
     refs = child_xf.GetReferences()
     refs.ClearReferences()
     refs.AddReference(Sdf.Reference(assetPath=LOCAL_TURTLEBOT_USD, primPath=TARGET_PRIM))
+
+    # Many robot USDs use payloads -> ensure they load
     child_xf.Load(Usd.LoadWithDescendants)
 
-    # place & scale wrapper
-    root_api = UsdGeom.XformCommonAPI(root_xf)
-    root_api.SetTranslate(Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height))
+    # Place the wrapper at START_XY (so all children move together)
+    UsdGeom.XformCommonAPI(root_xf) \
+           .SetTranslate(Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height)) \
+        #    .SetScale(Gf.Vec3f(BOT_SCALE, BOT_SCALE, BOT_SCALE))
+    root_api = UsdGeom.XformCommonAPI(root_xf)   # same root_xf you used for SetTranslate
     root_api.SetScale(Gf.Vec3f(BOT_SCALE, BOT_SCALE, BOT_SCALE))
 
+
+    # Debug prints so you can verify population
     kids = list(child_xf.GetChildren())
     print(f"[INFO] Referenced {LOCAL_TURTLEBOT_USD} @ {TARGET_PRIM} -> {TURTLE_CHILD_PRIM}")
     print(f"[INFO] Child count under Model: {len(kids)}")
@@ -307,54 +317,79 @@ try:
         print("   [DEBUG]", c.GetPath())
 
 except Exception as e:
+    # Fallback: visible placeholder under the same wrapper path
     print("[WARN] Could not reference TurtleBot; using a cylinder placeholder. Error:", e)
     cyl = UsdGeom.Cylinder.Define(stage, f"{TURTLE_MOVE_PRIM}/Cylinder")
     cyl.CreateHeightAttr(0.2)
     cyl.CreateRadiusAttr(0.18)
     UsdGeom.Imageable(cyl.GetPrim()).MakeVisible()
-    UsdGeom.XformCommonAPI(root_xf).SetTranslate(Gf.Vec3d(float(START_XY[0]), float(START_XY[1]), z_height))
+    UsdGeom.XformCommonAPI(root_xf).SetTranslate(
+        Gf.Vec3d(float(START_XY[0]), float(START_XY[1]) \
+                  , z_height
+                )
+    )
 
-world.reset()
-world.play()
 
-# ===== Xform utilities (version-proof) =====
-def _get_local_mat(prim) -> Gf.Matrix4d:
+def _ensure_srt_ops(prim: Usd.Prim):
     xf = UsdGeom.Xformable(prim)
-    res = xf.GetLocalTransformation()
-    return res[0] if isinstance(res, tuple) else res
-
-# ===== Pose helpers (x, y, yaw) on the wrapper prim =====
-def get_agent_pose() -> Tuple[float, float, float]:
+    sc = next((op for op in xf.GetOrderedXformOps() if op.GetOpType()==UsdGeom.XformOp.TypeScale), None)
+    rz = next((op for op in xf.GetOrderedXformOps() if op.GetOpType()==UsdGeom.XformOp.TypeRotateZ), None)
+    tr = next((op for op in xf.GetOrderedXformOps() if op.GetOpType()==UsdGeom.XformOp.TypeTranslate), None)
+    if sc is None: sc = xf.AddScaleOp()
+    if rz is None: rz = xf.AddRotateZOp()     # degrees
+    if tr is None: tr = xf.AddTranslateOp()
+    xf.SetXformOpOrder([sc, rz, tr])
+    return sc, rz, tr
+# ================== Pose helpers (use SRT ops) ==================
+def _get_srt():
     prim = stage.GetPrimAtPath(TURTLE_MOVE_PRIM)
-    mat = _get_local_mat(prim)
-    x = float(mat[3][0]); y = float(mat[3][1])
-    # yaw from rotation matrix (Z-up). Note: matrix layout is row-major in Gf.Matrix4d
-    yaw = math.atan2(float(mat[1][0]), float(mat[0][0]))
-    return x, y, yaw
+    return _ensure_srt_ops(prim)
+
+def get_agent_pose() -> Tuple[float, float, float]:
+    _, rz, tr = _get_srt()
+    t = tr.Get()
+    if t is None:
+        t = Gf.Vec3f(float(START_XY[0]), float(START_XY[1]), float(z_height))
+        tr.Set(t)
+    rz_val = rz.Get()
+    if rz_val is None:
+        rz_val = 0.0
+        rz.Set(rz_val)
+    yaw = math.radians(float(rz_val))
+    return float(t[0]), float(t[1]), float(yaw)
 
 def set_agent_pose(x: float, y: float, yaw: float):
-    c, s = math.cos(yaw), math.sin(yaw)
-    m = Gf.Matrix4d(
-        c, -s, 0.0, 0.0,
-        s,  c, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        float(x), float(y), float(z_height), 1.0
-    )
-    prim = stage.GetPrimAtPath(TURTLE_MOVE_PRIM)
-    UsdGeom.Xformable(prim).SetXformMatrix(m)
+    sc, rz, tr = _get_srt()
+    rz.Set(math.degrees(float(yaw)))
+    tr.Set(Gf.Vec3f(float(x), float(y), float(z_height)))
 
 def _wrap_pi(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
-# ===== Build planning grid =====
+# ================== Planning grid ==================
 grid = AStarGrid(MAP_W, MAP_H, RES, GRID_ORIGIN)
 for (xmin, ymin, xmax, ymax) in OBST_AABBS:
     grid.mark_box_obstacle(xmin, ymin, xmax, ymax, val=100)
 
-# ===== Planner/driver state =====
-path_xy: List[Tuple[float,float]] = []
-path_i = 0
-following = False
+# ================== ROS init ==================
+if not rclpy.ok():
+    rclpy.init(args=None)
+
+def _on_set_goal(x, y): set_goal_xy(x, y)
+def _on_plan(): trigger_plan_and_follow()
+def _on_cancel(): cancel_follow()
+
+ros = ROSBridge(
+    global_frame="map", base_frame="base_link", plan_topic="/plan",
+    on_set_goal=_on_set_goal, on_plan=_on_plan, on_cancel=_on_cancel,
+    twist_timeout=TWIST_TIMEOUT
+)
+
+# ================== Keyboard handling ==================
+key_state = { "up": False, "down": False, "left": False, "right": False, "enter": False, "space": False }
+app_window = omni.appwindow.get_default_app_window()
+keyboard   = app_window.get_keyboard()
+input_iface = carb_input.acquire_input_interface()
 
 def cancel_follow():
     global following, path_i
@@ -363,51 +398,11 @@ def cancel_follow():
 
 def trigger_plan_and_follow():
     global path_xy, path_i, following
-    start_xy = get_agent_pose()[:2]
-    path_xy = grid.plan(start_xy, GOAL_XY)
+    sx, sy, _ = get_agent_pose()
+    path_xy = grid.plan((sx, sy), GOAL_XY)
     ros.publish_path(path_xy)
     path_i = 0; following = bool(path_xy)
     print(f"[A*] Planned {len(path_xy)} waypoints." if path_xy else "[A*] No path.")
-
-# ===== ROS init =====
-if not rclpy.ok():
-    rclpy.init(args=None)
-
-def _on_set_goal(x, y):
-    set_goal_xy(x, y)
-
-def _on_plan():
-    trigger_plan_and_follow()
-
-def _on_cancel():
-    cancel_follow()
-
-def _on_speed(v_linear: Optional[float], w_angular: Optional[float]):
-    global AGENT_SPEED, MAX_W_AUTO
-    if v_linear is not None:
-        AGENT_SPEED = max(0.0, float(v_linear))
-        print(f"[speed] AGENT_SPEED set to {AGENT_SPEED:.2f} m/s")
-    if w_angular is not None:
-        MAX_W_AUTO = max(0.0, float(w_angular))
-        print(f"[speed] MAX_W_AUTO set to {MAX_W_AUTO:.2f} rad/s")
-
-ros = ROSBridge(
-    global_frame="map",
-    base_frame="base_link",
-    plan_topic="/plan",
-    on_set_goal=_on_set_goal,
-    on_plan=_on_plan,
-    on_cancel=_on_cancel,
-    on_speed=_on_speed,
-    auto_plan_on_goal=True,
-    twist_timeout=TWIST_TIMEOUT
-)
-
-# ===== Keyboard handling =====
-key_state = { "up": False, "down": False, "left": False, "right": False, "enter": False, "space": False }
-app_window = omni.appwindow.get_default_app_window()
-keyboard   = app_window.get_keyboard()
-input_iface = carb_input.acquire_input_interface()
 
 def _on_key_event(event: carb_input.KeyboardEvent) -> bool:
     is_press = event.type == carb_input.KeyboardEventType.KEY_PRESS
@@ -431,21 +426,23 @@ def _on_key_event(event: carb_input.KeyboardEvent) -> bool:
 
 kb_subscription = input_iface.subscribe_to_keyboard_events(keyboard, _on_key_event)
 
-# Initial path (optional): publish empty plan
-ros.publish_path(path_xy)
-print("[A*] Ready. Keys: ↑/↓ linear, ←/→ angular. Enter = plan+follow; Space = stop.")
-print("[ROS] Send /cmd_vel, /move_base_simple/goal, or /turtlebot_ctrl commands as needed.")
+# ================== Driver state ==================
+path_xy: List[Tuple[float,float]] = []
+path_i = 0
+following = False
 
-# ===== Main loop =====
+print("[A*] Ready. Keys: ↑/↓ linear, ←/→ angular. Enter = plan+follow; Space = stop.")
+print("[ROS] Send /cmd_vel Twist or /move_base_simple/goal to interact.")
+
+# ================== Main loop ==================
 try:
-    # robot state
     x, y, yaw = get_agent_pose()
 
     while simulation_app.is_running():
         dt = world.get_physics_dt()
         rclpy.spin_once(ros, timeout_sec=0.0)
 
-        # Handle one-shot keys
+        # One-shots
         if key_state["enter"]:
             trigger_plan_and_follow(); key_state["enter"] = False
         if key_state["space"]:
@@ -464,14 +461,12 @@ try:
             set_agent_pose(x, y, yaw)
 
         elif tw_active:
-            # ROS /cmd_vel drives when no keys pressed
             x  += v_tw * math.cos(yaw) * dt
             y  += v_tw * math.sin(yaw) * dt
             yaw = _wrap_pi(yaw + w_tw * dt)
             set_agent_pose(x, y, yaw)
 
         elif following and path_xy and path_i < len(path_xy):
-            # A* follow with heading control
             tx, ty = path_xy[path_i]
             dx, dy = tx - x, ty - y
             dist   = math.hypot(dx, dy)
@@ -490,9 +485,8 @@ try:
                 yaw = _wrap_pi(yaw + w * dt)
                 set_agent_pose(x, y, yaw)
 
-        # Publish TF for current pose
+        # TF
         ros.publish_tf(x, y, yaw)
-
         world.step(render=True)
 
 except Exception as e:
@@ -500,7 +494,7 @@ except Exception as e:
 finally:
     try:
         if kb_subscription:
-            input_iface.unsubscribe_to_keyboard_events(keyboard, kb_subscription)
+            input_iface.unsubscribe_to_keyboard_events(keyboard, _on_key_event)
     except Exception:
         pass
     try:
@@ -508,4 +502,4 @@ finally:
     except Exception:
         pass
     simulation_app.close()
-# ===== END =====
+# ================== END ==================
